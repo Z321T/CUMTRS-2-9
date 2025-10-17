@@ -5,3 +5,5 @@
 
 # 排除data文件夹及其所有内容
 /data/
+
+/result/

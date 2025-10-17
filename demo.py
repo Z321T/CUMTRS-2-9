@@ -5,48 +5,39 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 
 
-class HybridRecommendationSystem:
-    def __init__(self, chunk_size=1_000_000, max_rows=50_000_000):
+class TimeWindowRecommendationSystem:
+    def __init__(self, max_span=7, chunk_size=500_000, max_rows=50_000_000):
         """
-        混合推荐系统(特征工程 + LightGBM + 信号分层)
+        基于时间窗口的监督学习推荐系统(增强版)
 
         Args:
+            max_span: 最大时间窗口(天),默认7天
             chunk_size: 分块读取大小
             max_rows: 最大读取行数
         """
+        self.max_span = max_span
         self.chunk_size = chunk_size
         self.max_rows = max_rows
 
-        # 训练日期范围: 2014-11-18 ~ 2014-12-17 (不包含12-18)
+        # 训练日期范围: 2014-11-18 ~ 2014-12-18
         self.start_date = datetime(2014, 11, 18)
-        self.end_date = datetime(2014, 12, 17)
-        self.label_date = datetime(2014, 12, 18)  # 用12-18的购买作为标签
+        self.end_date = datetime(2014, 12, 18)
         self.target_date = datetime(2014, 12, 19)
 
-        # 行为权重配置(强信号优先)
-        self.behavior_weights = {
-            1: 1.0,  # 浏览(基础信号)
-            2: 3.0,  # 收藏(中等信号)
-            3: 5.0,  # 加购(强信号)
-            4: 10.0  # 购买(最强信号)
-        }
-
-        print("=" * 60)
-        print("混合推荐系统 - LightGBM + 特征工程 + 信号分层")
-        print("=" * 60)
-        print(f"配置: 分块大小={chunk_size:,}, 最大行数={max_rows:,}")
-        print(f"特征期: {self.start_date.date()} ~ {self.end_date.date()}")
-        print(f"标签日: {self.label_date.date()}")
+        print("=" * 50)
+        print("时间窗口监督学习推荐系统(增强版)")
+        print("=" * 50)
+        print(f"配置: 最大时间窗口={max_span}天, 分块大小={chunk_size:,}")
+        print(f"训练期: {self.start_date.date()} ~ {self.end_date.date()}")
         print(f"预测日: {self.target_date.date()}")
 
     def load_item_subset(self, item_file=r"data\tianchi_fresh_comp_train_item_online.txt"):
-        """加载商品子集P"""
-        print("\n[1/6] 加载商品子集...")
+        """加载商品子集"""
+        print("\n加载商品子集...")
         df = pd.read_csv(
             item_file, sep='\t', header=None,
             names=['item_id', 'item_geohash', 'item_category'],
@@ -63,42 +54,26 @@ class HybridRecommendationSystem:
             df['item_category'].fillna(-1).astype(np.int64)
         ))
 
-        print(f"  商品子集数量: {len(item_ids):,}")
+        print(f"商品子集数量: {len(item_ids):,}")
         return item_ids, item_category_map
 
-    def load_and_aggregate_behaviors(self, item_ids, item_category_map, files=None,
-                                     start_date=None, end_date=None, label_mode=False):
-        """
-        加载行为数据并聚合特征
-
-        Args:
-            label_mode: True=加载标签期数据, False=加载特征期数据
-        """
-        if start_date is None:
-            start_date = self.start_date
-        if end_date is None:
-            end_date = self.end_date
-
-        mode_name = "标签期" if label_mode else "特征期"
-        print(f"\n[2/6] 加载{mode_name}用户行为 ({start_date.date()} ~ {end_date.date()})...")
-
+    def load_behavior_data(self, item_ids, files=None):
+        """加载并按日期分组行为数据,增加用户/商品统计"""
+        print("\n加载用户行为数据...")
         if files is None:
             files = [
                 r"data\tianchi_fresh_comp_train_user_online_partA.txt",
                 r"data\tianchi_fresh_comp_train_user_online_partB.txt"
             ]
 
-        # 特征聚合字典
-        features_dict = defaultdict(lambda: {
-            'clicks': 0, 'collects': 0, 'carts': 0, 'purchases': 0,
-            'last_click_time': None, 'last_collect_time': None, 'last_cart_time': None,
-            'active_days': set(),
-            'weighted_score': 0.0
-        })
+        # 按日期分组的行为数据: {date: {(user_id, item_id): [浏览,收藏,加购,购买]}}
+        daily_behaviors = defaultdict(lambda: defaultdict(lambda: [0, 0, 0, 0]))
 
-        # 用户/商品/类目统计
-        user_stats = defaultdict(int)
-        item_stats = defaultdict(int)
+        # 用户活跃度统计
+        user_activity = defaultdict(lambda: {'total': 0, 'buy': 0, 'cart': 0, 'fav': 0})
+        # 商品热度统计
+        item_popularity = defaultdict(lambda: {'total': 0, 'buy': 0, 'cart': 0, 'fav': 0})
+        # 类目统计
         category_stats = defaultdict(lambda: {'total': 0, 'buy': 0})
 
         column_names = ['user_id', 'item_id', 'behavior_type', 'user_geohash', 'item_category', 'time']
@@ -106,15 +81,19 @@ class HybridRecommendationSystem:
         processed_rows = 0
 
         for file_idx, file_path in enumerate(files):
-            print(f"\n  处理文件 [{file_idx + 1}/{len(files)}]: {file_path}")
+            print(f"\n处理文件 [{file_idx + 1}/{len(files)}]: {file_path}")
+            chunk_count = 0
 
             for chunk in pd.read_csv(
                     file_path, sep='\t', header=None, names=column_names,
                     usecols=['user_id', 'item_id', 'behavior_type', 'item_category', 'time'],
                     chunksize=self.chunk_size, dtype='string', na_filter=False
             ):
+                chunk_count += 1
                 chunk_size = len(chunk)
                 total_rows += chunk_size
+
+                print(f"  - 分块 {chunk_count}: 读取 {chunk_size:,} 行, 累计 {total_rows:,} 行", end='')
 
                 # 类型转换
                 chunk['user_id'] = pd.to_numeric(chunk['user_id'].str.strip(), errors='coerce')
@@ -127,11 +106,9 @@ class HybridRecommendationSystem:
                 chunk = chunk[(chunk['behavior_type'] >= 1) & (chunk['behavior_type'] <= 4)]
                 chunk = chunk[chunk['item_id'].isin(item_ids)]
 
-                # 时间范围过滤
-                chunk = chunk[(chunk['time'] >= start_date) & (chunk['time'] <= end_date)]
-
                 valid_size = len(chunk)
                 processed_rows += valid_size
+                print(f", 有效 {valid_size:,} 行")
 
                 if valid_size == 0:
                     continue
@@ -140,293 +117,301 @@ class HybridRecommendationSystem:
                 chunk['item_id'] = chunk['item_id'].astype(np.int64)
                 chunk['behavior_type'] = chunk['behavior_type'].astype(np.int8)
                 chunk['item_category'] = chunk['item_category'].astype(np.int64)
+                chunk['date'] = chunk['time'].dt.date
 
-                # 聚合特征
-                for _, row in chunk.iterrows():
-                    uid, iid, btype, cat, time = row['user_id'], row['item_id'], row['behavior_type'], row[
-                        'item_category'], row['time']
-                    key = (uid, iid)
+                # 按日期和用户商品对聚合行为
+                for (date, uid, iid, btype), cnt in chunk.groupby(
+                        ['date', 'user_id', 'item_id', 'behavior_type']).size().items():
+                    daily_behaviors[date][(uid, iid)][btype - 1] += cnt
 
-                    # 行为频次统计
-                    if btype == 1:
-                        features_dict[key]['clicks'] += 1
-                        if features_dict[key]['last_click_time'] is None or time > features_dict[key][
-                            'last_click_time']:
-                            features_dict[key]['last_click_time'] = time
-                    elif btype == 2:
-                        features_dict[key]['collects'] += 1
-                        if features_dict[key]['last_collect_time'] is None or time > features_dict[key][
-                            'last_collect_time']:
-                            features_dict[key]['last_collect_time'] = time
-                    elif btype == 3:
-                        features_dict[key]['carts'] += 1
-                        if features_dict[key]['last_cart_time'] is None or time > features_dict[key]['last_cart_time']:
-                            features_dict[key]['last_cart_time'] = time
-                    elif btype == 4:
-                        features_dict[key]['purchases'] += 1
+                # 统计用户活跃度
+                for uid, group in chunk.groupby('user_id'):
+                    user_activity[uid]['total'] += len(group)
+                    user_activity[uid]['buy'] += (group['behavior_type'] == 4).sum()
+                    user_activity[uid]['cart'] += (group['behavior_type'] == 3).sum()
+                    user_activity[uid]['fav'] += (group['behavior_type'] == 2).sum()
 
-                    # 活跃天数
-                    features_dict[key]['active_days'].add(time.date())
+                # 统计商品热度
+                for iid, group in chunk.groupby('item_id'):
+                    item_popularity[iid]['total'] += len(group)
+                    item_popularity[iid]['buy'] += (group['behavior_type'] == 4).sum()
+                    item_popularity[iid]['cart'] += (group['behavior_type'] == 3).sum()
+                    item_popularity[iid]['fav'] += (group['behavior_type'] == 2).sum()
 
-                    # 时间衰减权重得分
-                    days_ago = (end_date - time).days
-                    decay_weight = np.exp(-days_ago / 5.0)  # 5天半衰期
-                    features_dict[key]['weighted_score'] += self.behavior_weights[btype] * decay_weight
-
-                    # 用户/商品/类目统计
-                    user_stats[uid] += 1
-                    item_stats[iid] += 1
-                    category_stats[cat]['total'] += 1
-                    if btype == 4:
-                        category_stats[cat]['buy'] += 1
-
-                print(f"    已处理 {processed_rows:,}/{total_rows:,} 有效行", end='\r')
+                # 统计类目
+                for cat, group in chunk.groupby('item_category'):
+                    category_stats[cat]['total'] += len(group)
+                    category_stats[cat]['buy'] += (group['behavior_type'] == 4).sum()
 
                 if total_rows >= self.max_rows:
-                    print(f"\n  已达到最大行数限制")
+                    print(f"\n  已达到最大行数限制 {self.max_rows:,}, 停止读取")
                     break
 
             if total_rows >= self.max_rows:
                 break
 
-        print(f"\n\n  加载完成: 总读取 {total_rows:,} 行, 有效 {processed_rows:,} 行")
-        print(f"  聚合用户-商品对: {len(features_dict):,}")
+        print(f"\n加载完成: 总读取 {total_rows:,} 行, 处理有效 {processed_rows:,} 行")
+        print(f"覆盖日期数: {len(daily_behaviors)} 天")
+        print(f"活跃用户数: {len(user_activity):,}")
+        print(f"热门商品数: {len(item_popularity):,}")
 
-        # 如果是标签模式,只返回购买对
-        if label_mode:
-            purchase_pairs = {key for key, feats in features_dict.items() if feats['purchases'] > 0}
-            print(f"  购买对数量: {len(purchase_pairs):,}")
-            return purchase_pairs
+        return daily_behaviors, user_activity, item_popularity, category_stats
 
-        # 构建特征DataFrame
-        print("\n  构建特征矩阵...")
-        records = []
-        for (uid, iid), feats in tqdm(features_dict.items(), desc="  构建特征"):
-            # 基础特征
-            rec = {
-                'user_id': uid,
-                'item_id': iid,
-                'clicks': feats['clicks'],
-                'collects': feats['collects'],
-                'carts': feats['carts'],
-            }
-
-            # 时间衰减特征
-            rec['last_click_days'] = (end_date - feats['last_click_time']).days if feats['last_click_time'] else 999
-            rec['last_collect_days'] = (end_date - feats['last_collect_time']).days if feats[
-                'last_collect_time'] else 999
-            rec['last_cart_days'] = (end_date - feats['last_cart_time']).days if feats['last_cart_time'] else 999
-
-            # 活跃度特征
-            rec['active_days_count'] = len(feats['active_days'])
-            rec['is_active_last_1day'] = 1 if any(d == end_date.date() for d in feats['active_days']) else 0
-            rec['is_active_last_3days'] = 1 if any(
-                (end_date - timedelta(days=2)).date() <= d <= end_date.date() for d in feats['active_days']) else 0
-
-            # 加权得分
-            rec['weighted_score'] = feats['weighted_score']
-
-            # 用户/商品热度
-            rec['user_total_behaviors'] = user_stats[uid]
-            rec['item_popularity'] = item_stats[iid]
-
-            # 类目购买率
-            cat = item_category_map.get(iid, -1)
-            if cat in category_stats and category_stats[cat]['total'] > 0:
-                rec['category_buy_rate'] = category_stats[cat]['buy'] / category_stats[cat]['total']
-            else:
-                rec['category_buy_rate'] = 0.0
-
-            # 信号强度分类(基于加购和收藏)
-            if feats['carts'] > 0:
-                rec['signal_level'] = 2  # 强信号
-            elif feats['collects'] > 0:
-                rec['signal_level'] = 1  # 中等信号
-            else:
-                rec['signal_level'] = 0  # 弱信号
-
-            records.append(rec)
-
-        df = pd.DataFrame(records)
-        print(f"  特征矩阵: {df.shape}")
-        return df
-
-    def create_labels(self, df, purchase_pairs):
+    def extract_features_for_span(self, daily_behaviors, user_activity, item_popularity,
+                                  category_stats, item_category_map, span):
         """
-        构造标签: 使用12-18的购买行为作为标签
+        提取增强特征(12维)
 
-        Args:
-            df: 特征DataFrame
-            purchase_pairs: 12-18当天的购买对集合
+        特征:
+        1-4: [浏览,收藏,加购,购买]次数
+        5: 用户活跃度(总行为数)
+        6: 用户购买率
+        7: 商品热度(总行为数)
+        8: 商品购买率
+        9: 商品加购率
+        10: 类目购买率
+        11: 时间衰减权重
+        12: 用户对该类目偏好度
         """
-        print("\n[3/6] 构造训练标签...")
+        features = []
+        labels = []
 
-        # 标记标签
-        df['label'] = df.apply(lambda x: 1 if (x['user_id'], x['item_id']) in purchase_pairs else 0, axis=1)
+        current_date = self.start_date.date()
+        date_count = 0
 
-        pos_count = df['label'].sum()
-        neg_count = len(df) - pos_count
+        while current_date + timedelta(days=span) <= self.end_date.date():
+            target_date = current_date + timedelta(days=span)
 
-        print(f"  正样本: {pos_count:,} ({pos_count / len(df) * 100:.2f}%)")
-        print(f"  负样本: {neg_count:,} ({neg_count / len(df) * 100:.2f}%)")
+            if current_date not in daily_behaviors:
+                current_date += timedelta(days=1)
+                continue
 
-        # 样本不平衡处理: 下采样负样本(保留正样本的5倍)
-        if neg_count > pos_count * 5:
-            print(f"  执行负样本下采样(保留正样本的5倍)...")
-            pos_df = df[df['label'] == 1]
-            neg_df = df[df['label'] == 0].sample(n=min(pos_count * 5, neg_count), random_state=42)
-            df = pd.concat([pos_df, neg_df]).sample(frac=1, random_state=42).reset_index(drop=True)
-            print(f"  下采样后样本数: {len(df):,}")
+            day_data = daily_behaviors[current_date]
+            target_data = daily_behaviors.get(target_date, {})
 
-        return df
+            date_count += 1
 
-    def train_model(self, df):
-        """
-        训练LightGBM模型
+            # 时间衰减: 距离预测日越近权重越高
+            days_to_target = (self.target_date.date() - current_date).days
+            time_decay = np.exp(-days_to_target / 7.0)
 
-        特征: 14维(行为频次+时间衰减+活跃度+热度+类目+加权得分+信号强度)
-        """
-        print("\n[4/6] 训练LightGBM模型...")
+            for (uid, iid), behavior in day_data.items():
+                # 基础特征(1-4维)
+                feat = list(behavior)
 
-        # 特征列(移除purchases避免标签泄露)
-        feature_cols = [
-            'clicks', 'collects', 'carts',
-            'last_click_days', 'last_collect_days', 'last_cart_days',
-            'active_days_count', 'is_active_last_1day', 'is_active_last_3days',
-            'weighted_score', 'user_total_behaviors', 'item_popularity',
-            'category_buy_rate', 'signal_level'
-        ]
+                # 用户特征(5-6维)
+                user_total = user_activity[uid]['total']
+                user_buy_rate = user_activity[uid]['buy'] / user_total if user_total > 0 else 0
+                feat.extend([user_total, user_buy_rate])
 
-        X = df[feature_cols]
-        y = df['label']
+                # 商品特征(7-9维)
+                item_total = item_popularity[iid]['total']
+                item_buy_rate = item_popularity[iid]['buy'] / item_total if item_total > 0 else 0
+                item_cart_rate = item_popularity[iid]['cart'] / item_total if item_total > 0 else 0
+                feat.extend([item_total, item_buy_rate, item_cart_rate])
 
-        # 训练集/验证集划分
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+                # 类目特征(10维)
+                cat = item_category_map.get(iid, -1)
+                cat_buy_rate = 0
+                if cat in category_stats and category_stats[cat]['total'] > 0:
+                    cat_buy_rate = category_stats[cat]['buy'] / category_stats[cat]['total']
+                feat.append(cat_buy_rate)
 
-        print(f"  训练集: {len(X_train):,}, 验证集: {len(X_val):,}")
+                # 时间衰减(11维)
+                feat.append(time_decay)
 
-        # LightGBM数据集
-        lgb_train = lgb.Dataset(X_train, y_train)
-        lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_train)
+                # 用户-类目偏好(12维)
+                user_cat_pref = 0
+                if cat != -1:
+                    user_cat_behaviors = sum(
+                        1 for d in daily_behaviors.values()
+                        for (u, i) in d.keys()
+                        if u == uid and item_category_map.get(i, -1) == cat
+                    )
+                    user_cat_pref = user_cat_behaviors / user_total if user_total > 0 else 0
+                feat.append(user_cat_pref)
 
-        # 检测GPU支持
-        try:
-            gpu_supported = 'gpu' in lgb.build_info().get('bin_constr', '')
-        except:
-            gpu_supported = False
+                features.append((uid, iid, feat))
 
-        # 模型参数
-        params = {
-            'objective': 'binary',
-            'metric': ['binary_logloss', 'auc'],
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.9,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'max_depth': 7,
-            'min_data_in_leaf': 50,
-            'lambda_l1': 0.1,
-            'lambda_l2': 0.1,
-            'seed': 42,
-            'verbose': -1
-        }
+                # 标签: span天后是否购买
+                label = 1 if target_data.get((uid, iid), [0, 0, 0, 0])[3] > 0 else 0
+                labels.append(label)
 
-        if gpu_supported:
-            print("  检测到GPU支持,启用GPU加速")
-            params.update({
-                'device': 'gpu',
-                'gpu_platform_id': 0,
-                'gpu_device_id': 0
+            if date_count % 5 == 0:
+                print(f"    处理日期 {current_date}, 已提取 {len(features):,} 个样本")
+
+            current_date += timedelta(days=1)
+
+        weight = sum(labels) / len(labels) if labels else 0.0
+        return features, labels, weight
+
+    def train_models(self, daily_behaviors, user_activity, item_popularity,
+                     category_stats, item_category_map):
+        """训练多个模型(LR + RF + GBDT)"""
+        print("\n训练分类器...")
+        models = []
+        weights = []
+
+        for span in range(1, self.max_span + 1):
+            print(f"\n[时间窗口 {span} 天]")
+            features, labels, weight = self.extract_features_for_span(
+                daily_behaviors, user_activity, item_popularity,
+                category_stats, item_category_map, span
+            )
+
+            if len(features) == 0:
+                print("  无可用样本,跳过")
+                continue
+
+            print(f"  提取样本数: {len(features):,}")
+            print(f"  正样本比例: {weight:.4f}")
+
+            # 特征矩阵(12维)
+            X = np.array([feat[2] for feat in features])
+            y = np.array(labels)
+
+            # 训练3个模型
+            print("  训练逻辑回归...")
+            lr_model = LogisticRegression(max_iter=1000, class_weight='balanced', C=0.1)
+            lr_model.fit(X, y)
+
+            print("  训练随机森林...")
+            rf_model = RandomForestClassifier(n_estimators=50, max_depth=10,
+                                              class_weight='balanced', random_state=42)
+            rf_model.fit(X, y)
+
+            print("  训练GBDT...")
+            gb_model = GradientBoostingClassifier(n_estimators=50, max_depth=5,
+                                                  learning_rate=0.1, random_state=42)
+            gb_model.fit(X, y)
+
+            models.append({
+                'lr': lr_model,
+                'rf': rf_model,
+                'gb': gb_model,
+                'span': span,
+                'features': features
             })
+            weights.append(weight)
 
-        # 训练模型
-        print("  开始训练...")
-        model = lgb.train(
-            params,
-            lgb_train,
-            num_boost_round=500,
-            valid_sets=[lgb_train, lgb_val],
-            valid_names=['train', 'valid'],
-            callbacks=[
-                lgb.early_stopping(stopping_rounds=30),
-                lgb.log_evaluation(period=50)
-            ]
-        )
+            print(f"  训练完成")
 
-        # 输出最佳性能
-        best_iter = model.best_iteration
-        print(f"\n  训练完成!")
-        print(f"  最佳迭代: {best_iter}")
+        # 归一化权重
+        if sum(weights) > 0:
+            weights = [w / sum(weights) for w in weights]
 
-        # 特征重要性
-        print("\n  Top 10 重要特征:")
-        importance = model.feature_importance(importance_type='gain')
-        feature_importance = pd.DataFrame({
-            'feature': feature_cols,
-            'importance': importance
-        }).sort_values('importance', ascending=False)
+        print(f"\n训练完成: 共 {len(models)} 个时间窗口")
+        print(f"权重分布: {[f'{w:.3f}' for w in weights]}")
 
-        for idx, row in feature_importance.head(10).iterrows():
-            print(f"    {row['feature']:25s}: {row['importance']:.1f}")
+        return models, weights
 
-        return model, feature_cols
+    def generate_predictions(self, models, weights, daily_behaviors, user_activity,
+                             item_popularity, category_stats, item_category_map, top_n=30):
+        """生成预测结果,融合3个模型"""
+        print("\n生成预测...")
 
-    def generate_predictions(self, model, feature_cols, df_all, item_category_map, top_n=30):
-        """
-        生成预测结果(动态阈值策略)
+        user_item_scores = defaultdict(float)
 
-        策略:
-        1. 强信号(signal_level=2): 概率>0.1即推荐
-        2. 中等信号(signal_level=1): 概率>0.2推荐
-        3. 弱信号(signal_level=0): 概率>0.3推荐
-        """
-        print("\n[5/6] 生成预测...")
+        for model_info, weight in zip(models, weights):
+            lr_model = model_info['lr']
+            rf_model = model_info['rf']
+            gb_model = model_info['gb']
+            span = model_info['span']
 
-        # 预测概率
-        X = df_all[feature_cols]
-        y_pred_proba = model.predict(X, num_iteration=model.best_iteration)
-        df_all['pred_proba'] = y_pred_proba
+            feature_date = (self.target_date - timedelta(days=span)).date()
 
-        # 动态阈值过滤
-        print("  应用动态阈值策略...")
-        conditions = [
-            (df_all['signal_level'] == 2) & (df_all['pred_proba'] > 0.1),  # 强信号
-            (df_all['signal_level'] == 1) & (df_all['pred_proba'] > 0.2),  # 中等信号
-            (df_all['signal_level'] == 0) & (df_all['pred_proba'] > 0.3),  # 弱信号
-        ]
-        df_filtered = df_all[np.logical_or.reduce(conditions)].copy()
+            if feature_date not in daily_behaviors:
+                print(f"  时间窗口 {span} 天: 无数据")
+                continue
 
-        print(f"  过滤后候选数: {len(df_filtered):,}")
+            day_data = daily_behaviors[feature_date]
+            print(f"  时间窗口 {span} 天: {len(day_data):,} 个用户商品对", end='')
 
-        # 如果过滤后为空,降低阈值
-        if len(df_filtered) == 0:
-            print("  警告: 过滤后无候选,降低阈值至0.05...")
-            df_filtered = df_all[df_all['pred_proba'] > 0.05].copy()
-            print(f"  新候选数: {len(df_filtered):,}")
+            processed = 0
+            days_to_target = (self.target_date.date() - feature_date).days
+            time_decay = np.exp(-days_to_target / 7.0)
 
-        # 按用户分组取Top-N
-        print("  按用户分组并排序...")
+            for (uid, iid), behavior in day_data.items():
+                # 构建12维特征
+                feat = list(behavior)
+
+                user_total = user_activity[uid]['total']
+                user_buy_rate = user_activity[uid]['buy'] / user_total if user_total > 0 else 0
+                feat.extend([user_total, user_buy_rate])
+
+                item_total = item_popularity[iid]['total']
+                item_buy_rate = item_popularity[iid]['buy'] / item_total if item_total > 0 else 0
+                item_cart_rate = item_popularity[iid]['cart'] / item_total if item_total > 0 else 0
+                feat.extend([item_total, item_buy_rate, item_cart_rate])
+
+                cat = item_category_map.get(iid, -1)
+                cat_buy_rate = 0
+                if cat in category_stats and category_stats[cat]['total'] > 0:
+                    cat_buy_rate = category_stats[cat]['buy'] / category_stats[cat]['total']
+                feat.append(cat_buy_rate)
+
+                feat.append(time_decay)
+
+                user_cat_pref = 0
+                if cat != -1:
+                    user_cat_behaviors = sum(
+                        1 for d in daily_behaviors.values()
+                        for (u, i) in d.keys()
+                        if u == uid and item_category_map.get(i, -1) == cat
+                    )
+                    user_cat_pref = user_cat_behaviors / user_total if user_total > 0 else 0
+                feat.append(user_cat_pref)
+
+                X = np.array([feat])
+
+                # 融合3个模型的预测概率
+                lr_prob = lr_model.predict_proba(X)[0][1]
+                rf_prob = rf_model.predict_proba(X)[0][1]
+                gb_prob = gb_model.predict_proba(X)[0][1]
+
+                # 加权平均(LR:0.3, RF:0.4, GBDT:0.3)
+                final_prob = 0.3 * lr_prob + 0.4 * rf_prob + 0.3 * gb_prob
+
+                user_item_scores[(uid, iid)] += final_prob * weight
+
+                processed += 1
+                if processed % 10000 == 0:
+                    print(f"\r  时间窗口 {span} 天: 已处理 {processed:,}/{len(day_data):,}", end='')
+
+            print(f"\r  时间窗口 {span} 天: 完成预测 {len(day_data):,} 个用户商品对")
+
+        print(f"\n候选用户商品对: {len(user_item_scores):,}")
+
+        # 过滤低质量推荐(得分阈值)
+        print("应用得分阈值过滤...")
+        score_threshold = np.percentile(list(user_item_scores.values()), 50)  # 取中位数
+        user_item_scores = {k: v for k, v in user_item_scores.items() if v >= score_threshold}
+        print(f"过滤后候选数: {len(user_item_scores):,}")
+
+        # 按用户分组并取Top-N
+        print("按用户分组并排序...")
+        user_recommendations = defaultdict(list)
+        for (uid, iid), score in user_item_scores.items():
+            user_recommendations[uid].append((iid, score))
+
+        print(f"总用户数: {len(user_recommendations):,}")
+
         recommendations = []
+        user_count = 0
+        for uid, items in user_recommendations.items():
+            items.sort(key=lambda x: x[1], reverse=True)
+            # 动态调整Top-N:高活跃用户推荐更多
+            user_total = user_activity[uid]['total']
+            dynamic_top_n = min(top_n, max(5, int(user_total / 10)))
 
-        for uid, group in tqdm(df_filtered.groupby('user_id'), desc="  生成推荐"):
-            # 按概率降序排序
-            group_sorted = group.sort_values('pred_proba', ascending=False)
+            for iid, _ in items[:dynamic_top_n]:
+                recommendations.append((uid, iid))
 
-            # 动态Top-N: 根据用户活跃度调整
-            user_activity = group_sorted['user_total_behaviors'].iloc[0]
-            dynamic_n = min(top_n, max(5, int(user_activity / 20)))
+            user_count += 1
+            if user_count % 1000 == 0:
+                print(f"  已处理 {user_count:,}/{len(user_recommendations):,} 个用户", end='\r')
 
-            for _, row in group_sorted.head(dynamic_n).iterrows():
-                recommendations.append((int(row['user_id']), int(row['item_id'])))
-
-        print(f"\n  生成推荐: {len(recommendations):,} 条")
-        user_count = len(set(uid for uid, _ in recommendations))
-        print(f"  推荐用户数: {user_count:,}")
-        if user_count > 0:
-            print(f"  平均每用户推荐: {len(recommendations) / user_count:.2f} 个商品")
-
+        print(f"\n生成推荐: {len(recommendations):,} 条")
         return recommendations
 
     def save_results(self, recommendations, out_dir=r"result"):
@@ -435,62 +420,43 @@ class HybridRecommendationSystem:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         out_file = os.path.join(out_dir, f"recommendation_{timestamp}.txt")
 
-        print(f"\n[6/6] 保存结果到: {out_file}")
+        print(f"\n保存结果到: {out_file}")
         with open(out_file, 'w', encoding='utf-8') as f:
             for uid, iid in recommendations:
                 f.write(f"{uid}\t{iid}\n")
 
-        print(f"保存完成!")
+        print(f"保存完成: {len(recommendations):,} 条推荐")
+        user_count = len(set(uid for uid, _ in recommendations))
+        print(f"推荐用户数: {user_count:,}")
+        print(f"平均每用户推荐: {len(recommendations) / user_count:.2f} 个商品")
         return out_file
 
 
 def main():
-    print("\n" + "=" * 60)
-    print("开始运行混合推荐系统")
-    print("=" * 60)
-
-    # 初始化系统
-    rec_sys = HybridRecommendationSystem(
-        chunk_size=1_000_000,
+    rec_sys = TimeWindowRecommendationSystem(
+        max_span=7,
+        chunk_size=500_000,
         max_rows=50_000_000
     )
 
-    # [1] 加载商品子集
     item_ids, item_category_map = rec_sys.load_item_subset()
+    daily_behaviors, user_activity, item_popularity, category_stats = rec_sys.load_behavior_data(item_ids)
 
-    # [2] 加载特征期行为数据(11-18 ~ 12-17)
-    df_features = rec_sys.load_and_aggregate_behaviors(
-        item_ids, item_category_map,
-        start_date=rec_sys.start_date,
-        end_date=rec_sys.end_date,
-        label_mode=False
+    models, weights = rec_sys.train_models(
+        daily_behaviors, user_activity, item_popularity,
+        category_stats, item_category_map
     )
 
-    # [2.5] 加载标签期购买数据(12-18)
-    purchase_pairs = rec_sys.load_and_aggregate_behaviors(
-        item_ids, item_category_map,
-        start_date=rec_sys.label_date,
-        end_date=rec_sys.label_date,
-        label_mode=True
-    )
-
-    # [3] 构造标签
-    df_labeled = rec_sys.create_labels(df_features.copy(), purchase_pairs)
-
-    # [4] 训练模型
-    model, feature_cols = rec_sys.train_model(df_labeled)
-
-    # [5] 生成预测(使用全量特征数据)
     recommendations = rec_sys.generate_predictions(
-        model, feature_cols, df_features, item_category_map, top_n=30
+        models, weights, daily_behaviors, user_activity,
+        item_popularity, category_stats, item_category_map, top_n=10
     )
 
-    # [6] 保存结果
     out_file = rec_sys.save_results(recommendations)
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 50)
     print("完成!")
-    print("=" * 60)
+    print("=" * 50)
 
 
 if __name__ == "__main__":
